@@ -36,6 +36,8 @@ import StageTag from '@/components/common/StageTag';
 import { useCoatProgress } from '@/hooks/useCoatProgress';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { usePolishStore } from '@/stores/polishStore';
+import { evaluateCoatGate } from '@/utils/polish';
 import {
   COAT_STATE_LABEL,
   COAT_STATE_OPTIONS,
@@ -74,6 +76,7 @@ export default function CoatBoard() {
   const reorderCoats = useCoatStore((state) => state.reorderCoats);
   const nextSeq = useCoatStore((state) => state.nextSeq);
   const suggestForBody = useCoatStore((state) => state.suggestForBody);
+  const polishes = usePolishStore((state) => state.polishes);
 
   const { progressOf, currentCoatText, totals } = useCoatProgress();
   const url = useFilterQuery(FILTER_KEYS);
@@ -178,15 +181,25 @@ export default function CoatBoard() {
     message.success('道次顺序已更新并重编号');
   };
 
-  /** 状态推进校验：前一道未完成时禁止进入下一道 */
+  /** 状态推进校验：前一道未完成时禁止进入下一道；推到已完成前必须对上打磨对牌 */
   const handleAdvance = async (coat: Coat): Promise<void> => {
     const previous = bodyCoats.find((item) => item.seq === coat.seq - 1);
     if (previous && previous.state !== 'done') {
       message.warning(`第 ${previous.seq} 道尚未完成，禁止进入第 ${coat.seq} 道`);
       return;
     }
-    await advanceState(coat.id);
+    const result = await advanceState(coat.id);
+    if (result.blocked) {
+      // 对牌未过：停在待打磨，不罩漆推进
+      message.warning(result.reason || '对牌未过，已停在待打磨');
+    } else {
+      message.success(`第 ${coat.seq} 道已推进`);
+    }
   };
+
+  /** 本道打磨对牌状态（只读打磨工位底稿） */
+  const gateOf = (coat: Coat): { ok: boolean; reason: string } =>
+    evaluateCoatGate(coat, bodyCoats, polishes.filter((item) => item.bodyId === bodyId));
 
   const columns: ColumnsType<Coat> = [
     {
@@ -217,6 +230,24 @@ export default function CoatBoard() {
       render: (seq: number, record) => (
         <StageTag state={record.state} seq={seq} needRecheck={record.needRecheck} />
       ),
+    },
+    {
+      title: '打磨对牌',
+      key: 'gate',
+      width: 170,
+      render: (_value, record) => {
+        const gate = gateOf(record);
+        if (record.state === 'done') {
+          return <Tag color="success">已罩漆完成</Tag>;
+        }
+        return gate.ok ? (
+          <Tag color="success">对牌已过</Tag>
+        ) : (
+          <Tooltip title={gate.reason}>
+            <Tag color="warning">待打磨</Tag>
+          </Tooltip>
+        );
+      },
     },
     { title: '漆种', dataIndex: 'paintType', width: 100, render: (value: PaintType) => <Tag>{PAINT_TYPE_LABEL[value]}</Tag> },
     { title: '色名', dataIndex: 'colorName', width: 120 },

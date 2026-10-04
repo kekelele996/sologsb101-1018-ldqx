@@ -17,7 +17,7 @@ import type { Inspect } from '@/types/inspect';
 export const DB_NAME = 'gblacquer';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -99,7 +99,7 @@ class LacquerDatabase extends Dexie {
     });
 
     // v2：Coat 增加 paintType 索引；历史记录缺少 paintType 时按「生漆」回填
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         bodies: 'id, code, material, shape, state, updatedAt',
         coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
@@ -119,6 +119,28 @@ class LacquerDatabase extends Dexie {
             if (typeof coat.thicknessUm !== 'number') coat.thicknessUm = 40;
           });
       });
+
+    // v3：打磨记录补「道次归属」coatId 索引。
+    // 旧打磨记录只有胎体编号 + 序号，升级时按 bodyId+seq 补出道次归属；
+    // 对不上的记录保持 coatId 为空，由打磨工位单列「待认领」，且绝不回退已罩漆道次状态。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        bodies: 'id, code, material, shape, state, updatedAt',
+        coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
+        rooms: 'id, bodyId, date, verdict, updatedAt',
+        polishes: 'id, bodyId, coatId, seq, method, updatedAt',
+        inlays: 'id, bodyId, type, position, updatedAt',
+        inspects: 'id, bodyId, verdict, date, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const coats = await tx.table<Coat>('coats').toArray();
+        await tx.table<Polish>('polishes').toCollection().modify((polish) => {
+          if (polish.coatId != null) return;
+          const match = coats.find((coat) => coat.bodyId === polish.bodyId && coat.seq === polish.seq);
+          if (match) polish.coatId = match.id;
+          // 对不上的保持 coatId 为空 → 待认领；不触碰任何道次状态
+        });
+      });
   }
 }
 
@@ -131,6 +153,25 @@ const TABLE_LIST = [db.bodies, db.coats, db.rooms, db.polishes, db.inlays, db.in
 export function createId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${Date.now().toString(36)}${rand}`;
+}
+
+/**
+ * 写入重试：哪一侧写入失败就只按本侧重试，绝不波及另一摊的底稿。
+ * 打磨工位与髹涂工序台各写各的表，失败时各自重试自己的写入，不替对方落库。
+ */
+export async function withDbRetry<T>(fn: () => Promise<T>, attempts = 3, label = '写入'): Promise<T> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (i < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 60 * (i + 1)));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`${label}失败`);
 }
 
 /** 打开数据库并在首次使用时播种演示数据（幂等） */
@@ -202,10 +243,12 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const polishes: Polish[] = [
-    { id: 'polish_0101', bodyId: 'body_01', seq: 1, grit: 600, method: 'water', durationMin: 35, operator: '王丽', createdAt: now - 86400000 * 9, updatedAt: now - 86400000 * 9 },
-    { id: 'polish_0102', bodyId: 'body_01', seq: 2, grit: 1500, method: 'burnish', durationMin: 45, operator: '王丽', createdAt: now - 86400000 * 2, updatedAt: now - 86400000 * 2 },
-    { id: 'polish_0201', bodyId: 'body_02', seq: 1, grit: 800, method: 'water', durationMin: 30, operator: '李成', createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
-    { id: 'polish_0301', bodyId: 'body_03', seq: 3, grit: 2000, method: 'burnish', durationMin: 60, operator: '王丽', createdAt: now - 86400000 * 5, updatedAt: now - 86400000 * 4 },
+    { id: 'polish_0101', bodyId: 'body_01', coatId: 'coat_0101', seq: 1, grit: 600, method: 'water', durationMin: 35, operator: '王丽', createdAt: now - 86400000 * 9, updatedAt: now - 86400000 * 9 },
+    { id: 'polish_0102', bodyId: 'body_01', coatId: 'coat_0102', seq: 2, grit: 1500, method: 'burnish', durationMin: 45, operator: '王丽', createdAt: now - 86400000 * 2, updatedAt: now - 86400000 * 2 },
+    // 待认领：只有胎体编号 + 序号、对不上任何道次（body_01 只有 3 道），由打磨工位单列
+    { id: 'polish_0103', bodyId: 'body_01', coatId: null, seq: 4, grit: 2000, method: 'burnish', durationMin: 50, operator: '王丽', createdAt: now - 86400000 * 1, updatedAt: now - 86400000 * 1 },
+    { id: 'polish_0201', bodyId: 'body_02', coatId: 'coat_0201', seq: 1, grit: 800, method: 'water', durationMin: 30, operator: '李成', createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
+    { id: 'polish_0301', bodyId: 'body_03', coatId: 'coat_0303', seq: 3, grit: 2000, method: 'burnish', durationMin: 60, operator: '王丽', createdAt: now - 86400000 * 5, updatedAt: now - 86400000 * 4 },
   ];
 
   const inlays: Inlay[] = [

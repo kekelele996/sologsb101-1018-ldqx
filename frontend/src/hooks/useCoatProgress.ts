@@ -5,6 +5,7 @@
 import { useCallback, useMemo } from 'react';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { usePolishStore } from '@/stores/polishStore';
 import { useRoomStore } from '@/stores/roomStore';
 import { dryingHours, roomStayHours } from '@/utils/humidity';
 import { ROOM_VERDICT_LABEL } from '@/types/room';
@@ -42,6 +43,7 @@ export function useCoatProgress(): CoatProgressResult {
   const bodies = useBodyStore((state) => state.bodies);
   const coats = useCoatStore((state) => state.coats);
   const rooms = useRoomStore((state) => state.rooms);
+  const polishes = usePolishStore((state) => state.polishes);
 
   const map = useMemo<Record<string, BodyStat>>(() => {
     const result: Record<string, BodyStat> = {};
@@ -72,13 +74,13 @@ export function useCoatProgress(): CoatProgressResult {
         lastRoomVerdict: lastRoom
           ? `${lastRoom.date}　${lastRoom.tempC}℃ / ${lastRoom.humidityPct}%（${ROOM_VERDICT_LABEL[lastRoom.verdict]}）`
           : '暂无记录',
-        polishCount: 0,
+        polishCount: polishes.filter((polish) => polish.bodyId === body.id).length,
         inlayCount: 0,
         dryingHours: waitHours,
       };
     });
     return result;
-  }, [bodies, coats, rooms]);
+  }, [bodies, coats, rooms, polishes]);
 
   const list = useMemo(() => bodies.map((body) => map[body.id] ?? { ...EMPTY_STAT, bodyId: body.id }), [bodies, map]);
 
