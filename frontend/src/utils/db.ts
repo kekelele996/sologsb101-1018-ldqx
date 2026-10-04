@@ -9,7 +9,7 @@ import Dexie, { type Table } from 'dexie';
 import type { Body } from '@/types/body';
 import type { Coat, PaintType } from '@/types/coat';
 import type { Room } from '@/types/room';
-import type { Polish } from '@/types/polish';
+import type { Polish, PolishClaimState } from '@/types/polish';
 import type { Inlay } from '@/types/inlay';
 import type { Inspect } from '@/types/inspect';
 
@@ -17,7 +17,7 @@ import type { Inspect } from '@/types/inspect';
 export const DB_NAME = 'gblacquer';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -99,7 +99,7 @@ class LacquerDatabase extends Dexie {
     });
 
     // v2：Coat 增加 paintType 索引；历史记录缺少 paintType 时按「生漆」回填
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         bodies: 'id, code, material, shape, state, updatedAt',
         coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
@@ -117,6 +117,38 @@ class LacquerDatabase extends Dexie {
             if (!legal.includes(coat.paintType)) coat.paintType = 'raw';
             if (typeof coat.needRecheck !== 'boolean') coat.needRecheck = false;
             if (typeof coat.thicknessUm !== 'number') coat.thicknessUm = 40;
+          });
+      });
+
+    // v3：打磨工位与髹涂工序台分账 —— 打磨记录增加挂名道次 coatSeq、
+    // 挂名状态 claimState、来源 source；旧记录只有胎体编号 + 序号，按序号补出道次归属。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        bodies: 'id, code, material, shape, state, updatedAt',
+        coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
+        rooms: 'id, bodyId, date, verdict, updatedAt',
+        polishes: 'id, bodyId, seq, coatSeq, claimState, source, method, updatedAt',
+        inlays: 'id, bodyId, type, position, updatedAt',
+        inspects: 'id, bodyId, verdict, date, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const coats = await tx.table<Coat>('coats').toArray();
+        const coatStateOf = (bodyId: string, seq: number): string | undefined =>
+          coats.find((coat) => coat.bodyId === bodyId && coat.seq === seq)?.state;
+        await tx
+          .table<Polish>('polishes')
+          .toCollection()
+          .modify((polish) => {
+            // 旧打磨记录只有 bodyId + seq：按序号补出道次归属
+            if (typeof polish.coatSeq !== 'number') polish.coatSeq = polish.seq;
+            if (polish.source !== 'regular' && polish.source !== 'late') polish.source = 'regular';
+            const coatState = coatStateOf(polish.bodyId, polish.coatSeq);
+            // 挂得到「待打磨」道次算已挂名；道次不存在或已罩漆完成的，列为待认领（不退回道次）
+            let claimState: PolishClaimState;
+            if (coatState === 'toPolish') claimState = 'linked';
+            else if (coatState === undefined || coatState === 'done') claimState = 'unclaimed';
+            else claimState = 'linked';
+            polish.claimState = claimState;
           });
       });
   }
@@ -188,7 +220,7 @@ export async function seedDatabase(): Promise<void> {
     { id: 'coat_0102', bodyId: 'body_01', seq: 2, paintType: 'color', colorName: '朱红', coatDate: '2026-03-06', thicknessUm: 45, state: 'toPolish', needRecheck: true, createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 2 },
     { id: 'coat_0103', bodyId: 'body_01', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-12', thicknessUm: 30, state: 'todo', needRecheck: false, createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
     { id: 'coat_0201', bodyId: 'body_02', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-03', thicknessUm: 35, state: 'done', needRecheck: false, createdAt: now - 86400000 * 8, updatedAt: now - 86400000 * 7 },
-    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'coated', needRecheck: true, createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
+    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'toPolish', needRecheck: true, createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
     { id: 'coat_0301', bodyId: 'body_03', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-02-10', thicknessUm: 38, state: 'done', needRecheck: false, createdAt: now - 86400000 * 26, updatedAt: now - 86400000 * 25 },
     { id: 'coat_0302', bodyId: 'body_03', seq: 2, paintType: 'color', colorName: '石绿', coatDate: '2026-02-18', thicknessUm: 44, state: 'done', needRecheck: false, createdAt: now - 86400000 * 20, updatedAt: now - 86400000 * 18 },
     { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
@@ -202,10 +234,12 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const polishes: Polish[] = [
-    { id: 'polish_0101', bodyId: 'body_01', seq: 1, grit: 600, method: 'water', durationMin: 35, operator: '王丽', createdAt: now - 86400000 * 9, updatedAt: now - 86400000 * 9 },
-    { id: 'polish_0102', bodyId: 'body_01', seq: 2, grit: 1500, method: 'burnish', durationMin: 45, operator: '王丽', createdAt: now - 86400000 * 2, updatedAt: now - 86400000 * 2 },
-    { id: 'polish_0201', bodyId: 'body_02', seq: 1, grit: 800, method: 'water', durationMin: 30, operator: '李成', createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
-    { id: 'polish_0301', bodyId: 'body_03', seq: 3, grit: 2000, method: 'burnish', durationMin: 60, operator: '王丽', createdAt: now - 86400000 * 5, updatedAt: now - 86400000 * 4 },
+    { id: 'polish_0101', bodyId: 'body_01', seq: 1, coatSeq: 1, grit: 600, method: 'water', durationMin: 35, operator: '王丽', source: 'regular', claimState: 'linked', createdAt: now - 86400000 * 9, updatedAt: now - 86400000 * 9 },
+    { id: 'polish_0102', bodyId: 'body_01', seq: 2, coatSeq: 2, grit: 1500, method: 'burnish', durationMin: 45, operator: '王丽', source: 'regular', claimState: 'linked', createdAt: now - 86400000 * 2, updatedAt: now - 86400000 * 2 },
+    { id: 'polish_0201', bodyId: 'body_02', seq: 1, coatSeq: 1, grit: 800, method: 'water', durationMin: 30, operator: '李成', source: 'regular', claimState: 'linked', createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
+    { id: 'polish_0301', bodyId: 'body_03', seq: 1, coatSeq: 3, grit: 2000, method: 'burnish', durationMin: 60, operator: '王丽', source: 'late', claimState: 'unclaimed', createdAt: now - 86400000 * 5, updatedAt: now - 86400000 * 4 },
+    // 事后补记但胎体上根本没有该道次：补不上，由打磨工位单列待认领，且不回退已罩漆的道次
+    { id: 'polish_0302', bodyId: 'body_03', seq: 2, coatSeq: null, grit: 1000, method: 'wipe', durationMin: 25, operator: '李成', source: 'late', claimState: 'unclaimed', createdAt: now - 86400000 * 3, updatedAt: now - 86400000 * 3 },
   ];
 
   const inlays: Inlay[] = [
@@ -280,13 +314,35 @@ export function validateSnapshot(input: unknown): string {
 
 export async function importSnapshot(snapshot: LacquerSnapshot): Promise<void> {
   await clearAllTables();
+  // 导入旧版本备份不会走 Dexie upgrade，这里按 v2→v3 同一规则给打磨记录补挂名归属
+  const polishes = normalizeImportedPolishes(snapshot.polishes, snapshot.coats);
   await db.transaction('rw', TABLE_LIST, async () => {
     await db.bodies.bulkPut(snapshot.bodies);
     await db.coats.bulkPut(snapshot.coats);
     await db.rooms.bulkPut(snapshot.rooms);
-    await db.polishes.bulkPut(snapshot.polishes);
+    await db.polishes.bulkPut(polishes);
     await db.inlays.bulkPut(snapshot.inlays);
     await db.inspects.bulkPut(snapshot.inspects);
+  });
+}
+
+/** 旧备份的打磨记录只有胎体编号 + 序号：按序号补出道次归属与挂名状态 */
+function normalizeImportedPolishes(polishes: Polish[], coats: Coat[]): Polish[] {
+  const coatStateOf = (bodyId: string, coatSeq: number | null): string | undefined =>
+    coatSeq === null
+      ? undefined
+      : coats.find((coat) => coat.bodyId === bodyId && coat.seq === coatSeq)?.state;
+  return polishes.map((polish) => {
+    const coatSeq: number | null = typeof polish.coatSeq === 'number' ? polish.coatSeq : polish.seq;
+    const source = polish.source === 'late' || polish.source === 'regular' ? polish.source : 'regular';
+    const coatState = coatStateOf(polish.bodyId, coatSeq);
+    const claimState: PolishClaimState =
+      polish.claimState === 'linked' || polish.claimState === 'unclaimed'
+        ? polish.claimState
+        : coatState === undefined || coatState === 'done'
+          ? 'unclaimed'
+          : 'linked';
+    return { ...polish, coatSeq, source, claimState };
   });
 }
 

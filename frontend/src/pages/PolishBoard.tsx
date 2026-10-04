@@ -1,7 +1,9 @@
 /**
- * /polish 打磨与推光工序录入
- * 按道次生成目数序列，未打磨完的道次禁止进入下一道罩漆。
- * 消费 Polish、Coat；复用 <StageTag>、<StatBadge>、<EmptyPanel>。
+ * /polish 打磨工位（打磨推光记录与磨料目数底稿）
+ * 只管自己的 polishes 底稿；读道次仅为显示与判定挂名，绝不回写 coats。
+ * - 记录可挂在「待打磨」道次名下；已罩漆（已完成）道次不退回补挂；
+ * - 补不上道次的记录由工位单列「待认领」；
+ * - 能不能推出待打磨由髹涂工序台对挂名记录与目数（比上一道更细）核验。
  */
 import { useMemo, useState } from 'react';
 import {
@@ -9,6 +11,7 @@ import {
   App as AntdApp,
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
   InputNumber,
@@ -18,41 +21,50 @@ import {
   Space,
   Table,
   Tag,
-  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { DeleteOutlined, EditOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, LinkOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import StatBadge from '@/components/common/StatBadge';
 import StageTag from '@/components/common/StageTag';
 import { useCoatProgress } from '@/hooks/useCoatProgress';
-import { useIdbTable } from '@/hooks/useIdbTable';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { usePolishStore } from '@/stores/polishStore';
 import {
   GRIT_SEQUENCE,
   POLISH_METHOD_COLOR,
   POLISH_METHOD_LABEL,
   POLISH_METHOD_OPTIONS,
+  POLISH_SOURCE_LABEL,
   createEmptyPolishDraft,
-  suggestGrit,
   type Polish,
   type PolishDraft,
   type PolishMethod,
 } from '@/types/polish';
 import { BODY_SHAPE_LABEL } from '@/types/body';
+import { COAT_STATE_LABEL } from '@/types/coat';
+
+/** 表单里「暂不挂名（待认领）」的选项值 */
+const NO_COAT_VALUE = -1;
+/** 可选目数：标准序列之外留出精抛目数 */
+const GRIT_OPTIONS: readonly number[] = [...GRIT_SEQUENCE, 2500, 3000];
 
 export default function PolishBoard() {
   const { message } = AntdApp.useApp();
-  const [form] = Form.useForm<PolishDraft>();
-  const polishTable = useIdbTable<Polish>((database) => database.polishes, { sortByUpdatedAt: false });
+  const [form] = Form.useForm<PolishDraft & { late?: boolean }>();
 
   const bodies = useBodyStore((state) => state.bodies);
   const currentBodyId = useBodyStore((state) => state.currentBodyId);
   const setCurrentBodyId = useBodyStore((state) => state.setCurrentBodyId);
   const coats = useCoatStore((state) => state.coats);
-  const updateCoat = useCoatStore((state) => state.updateCoat);
+  const polishes = usePolishStore((state) => state.polishes);
+  const createPolish = usePolishStore((state) => state.createPolish);
+  const updatePolish = usePolishStore((state) => state.updatePolish);
+  const removePolish = usePolishStore((state) => state.removePolish);
+  const claimPolish = usePolishStore((state) => state.claimPolish);
+  const generateForBody = usePolishStore((state) => state.generateForBody);
   const { progressOf } = useCoatProgress();
 
   const [open, setOpen] = useState(false);
@@ -66,35 +78,72 @@ export default function PolishBoard() {
     [coats, bodyId],
   );
 
+  /** 当前胎体的打磨底稿，按工位序号排列 */
   const rows = useMemo(
     () =>
-      polishTable.rows
+      polishes
         .filter((row) => row.bodyId === bodyId)
-        .sort((a, b) => (a.seq === b.seq ? a.grit - b.grit : a.seq - b.seq)),
-    [polishTable.rows, bodyId],
+        .sort((a, b) => (a.coatSeq === b.coatSeq ? a.grit - b.grit : a.seq - b.seq)),
+    [polishes, bodyId],
   );
 
-  /** 已涂但尚未打磨的道次：未打磨完禁止进入下一道罩漆 */
+  /** 工位单列：全部胎体里补不上道次的记录 */
+  const unclaimedRows = useMemo(
+    () => polishes.filter((row) => row.claimState === 'unclaimed').sort((a, b) => a.updatedAt - b.updatedAt),
+    [polishes],
+  );
+  const bodyUnclaimed = useMemo(
+    () => unclaimedRows.filter((row) => row.bodyId === bodyId),
+    [unclaimedRows, bodyId],
+  );
+
+  /** 髹涂台视角：处于待打磨但名下没有挂名记录的道次（推不出去） */
   const blocked = useMemo(
     () =>
       bodyCoats.filter(
-        (coat) => coat.state === 'toPolish' && !rows.some((row) => row.seq === coat.seq),
+        (coat) =>
+          coat.state === 'toPolish' &&
+          !polishes.some((row) => row.bodyId === bodyId && row.claimState === 'linked' && row.coatSeq === coat.seq),
       ),
-    [bodyCoats, rows],
+    [bodyCoats, polishes, bodyId],
   );
 
   const stat = bodyId ? progressOf(bodyId) : null;
   const totalMinutes = rows.reduce((sum, row) => sum + row.durationMin, 0);
   const maxGrit = rows.reduce((max, row) => Math.max(max, row.grit), 0);
 
+  const coatOf = (bId: string, coatSeq: number | null) =>
+    coatSeq === null ? undefined : coats.find((coat) => coat.bodyId === bId && coat.seq === coatSeq);
+
+  /**
+   * 挂名道次选项：只允许挂到「待打磨」道次。
+   * 编辑时当前已挂的道次保留（可能已被髹涂台推进为已完成），其它非待打磨道次禁用，
+   * 避免误把记录挂到已罩漆道次上。
+   */
+  const coatOptions = useMemo(() => {
+    const options = bodyCoats.map((coat) => {
+      const isCurrent = editing?.coatSeq === coat.seq;
+      const selectable = coat.state === 'toPolish' || isCurrent;
+      return {
+        value: coat.seq,
+        label: `第 ${coat.seq} 道 · ${coat.colorName}（${COAT_STATE_LABEL[coat.state]}${isCurrent ? '·当前挂名' : ''}）`,
+        disabled: !selectable,
+      };
+    });
+    return [{ value: NO_COAT_VALUE, label: '暂不挂名（列为待认领）' }, ...options];
+  }, [bodyCoats, editing]);
+
   const openCreate = (): void => {
     if (!bodyId) {
       message.warning('请先选择胎体');
       return;
     }
-    const nextSeq = bodyCoats.length === 0 ? 1 : Math.max(...bodyCoats.map((coat) => coat.seq));
+    const firstWaiting = bodyCoats.find((coat) => coat.state === 'toPolish');
     setEditing(null);
-    form.setFieldsValue(createEmptyPolishDraft(bodyId, nextSeq));
+    form.setFieldsValue({
+      ...createEmptyPolishDraft(bodyId, firstWaiting?.seq ?? null),
+      late: false,
+    });
     setOpen(true);
   };
 
@@ -102,99 +151,107 @@ export default function PolishBoard() {
     setEditing(row);
     form.setFieldsValue({
       bodyId: row.bodyId,
-      seq: row.seq,
+      coatSeq: row.coatSeq,
       grit: row.grit,
       method: row.method,
       durationMin: row.durationMin,
       operator: row.operator,
+      source: row.source,
+      claimState: row.claimState,
+      late: row.source === 'late',
     });
     setOpen(true);
   };
 
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
+    const { late, ...rest } = values;
+    const payload: PolishDraft = {
+      ...rest,
+      coatSeq: rest.coatSeq === NO_COAT_VALUE ? null : rest.coatSeq,
+      source: late ? 'late' : 'regular',
+    };
     if (editing) {
-      await polishTable.update(editing.id, values);
-      message.success('已更新打磨记录');
+      await updatePolish(editing.id, payload);
+      message.success('已更新打磨底稿');
     } else {
-      await polishTable.create(values, 'polish');
-      message.success('已新增打磨记录');
+      const created = await createPolish(payload);
+      message.success(created.claimState === 'linked' ? '打磨记录已挂名道次' : '已登记，该记录列入待认领');
     }
     setOpen(false);
   };
 
-  /** 按道次生成目数序列：为每个尚无打磨记录的道次生成一条建议记录 */
+  /** 按道次铺排：只为「待打磨且尚无挂名记录」的道次生成，其他跳过 */
   const generateSequence = async (): Promise<void> => {
-    const targets = bodyCoats.filter((coat) => !rows.some((row) => row.seq === coat.seq));
-    if (targets.length === 0) {
-      message.info('所有道次均已有打磨记录');
+    if (!bodyId) return;
+    const { created, skipped } = await generateForBody(bodyId);
+    if (created === 0) {
+      message.info(skipped > 0 ? '待打磨道次均已有挂名记录' : '当前没有待打磨的道次可挂名');
       return;
     }
-    for (const coat of targets) {
-      await polishTable.create(
-        {
-          bodyId,
-          seq: coat.seq,
-          grit: suggestGrit(coat.seq),
-          method: coat.seq >= 3 ? 'burnish' : 'water',
-          durationMin: 30 + coat.seq * 5,
-          operator: '',
-        },
-        'polish',
-      );
-    }
-    message.success(`已按 ${targets.length} 个道次生成目数序列（${GRIT_SEQUENCE.slice(0, targets.length).join(' / ')}）`);
+    message.success(`已为 ${created} 个待打磨道次挂名铺排目数${skipped > 0 ? `，跳过 ${skipped} 道已有记录` : ''}`);
   };
 
-  /** 打磨完成后把道次推进到已完成 */
-  const finishPolish = async (row: Polish): Promise<void> => {
-    const coat = bodyCoats.find((item) => item.seq === row.seq);
-    if (!coat) {
-      message.warning('未找到对应道次');
-      return;
-    }
-    await updateCoat(coat.id, { state: 'done', needRecheck: false });
-    message.success(`第 ${row.seq} 道打磨完成，道次已置为已完成`);
+  /** 待认领记录挂到某待打磨道次名下：只改打磨底稿，不触碰道次 */
+  const claim = (row: Polish, coatSeq: number): void => {
+    void claimPolish(row.id, coatSeq)
+      .then(() => message.success(`已挂到第 ${coatSeq} 道名下`))
+      .catch((error: unknown) => message.error(error instanceof Error ? error.message : '认领失败'));
   };
 
-  const columns: ColumnsType<Polish> = [
+  const linkedColumns: ColumnsType<Polish> = [
     {
-      title: '关联道次',
-      dataIndex: 'seq',
-      width: 120,
-      render: (seq: number) => {
-        const coat = bodyCoats.find((item) => item.seq === seq);
-        return coat ? <StageTag state={coat.state} seq={seq} needRecheck={coat.needRecheck} /> : `第 ${seq} 道`;
+      title: '挂名道次',
+      dataIndex: 'coatSeq',
+      width: 150,
+      render: (coatSeq: number | null) => {
+        const coat = coatOf(bodyId, coatSeq);
+        return coat ? (
+          <StageTag state={coat.state} seq={coat.seq} needRecheck={coat.needRecheck} />
+        ) : (
+          <Tag>未挂名（待认领）</Tag>
+        );
       },
     },
     { title: '磨料目数', dataIndex: 'grit', width: 110, render: (value: number) => <Tag color="gold">{value} 目</Tag> },
     {
       title: '手法',
       dataIndex: 'method',
-      width: 100,
+      width: 90,
       render: (value: PolishMethod) => <Tag color={POLISH_METHOD_COLOR[value]}>{POLISH_METHOD_LABEL[value]}</Tag>,
     },
-    { title: '耗时', dataIndex: 'durationMin', width: 100, render: (value: number) => `${value} 分钟` },
-    { title: '操作人', dataIndex: 'operator', width: 110, render: (value: string) => value || '未填写' },
+    { title: '耗时', dataIndex: 'durationMin', width: 90, render: (value: number) => `${value} 分钟` },
+    { title: '操作人', dataIndex: 'operator', width: 100, render: (value: string) => value || '未填写' },
+    {
+      title: '来源 / 挂名',
+      dataIndex: 'source',
+      width: 120,
+      render: (value: Polish['source'], record) => (
+        <Space size={4} wrap>
+          {value === 'late' ? (
+            <Tag color="orange">{POLISH_SOURCE_LABEL.late}</Tag>
+          ) : (
+            <Tag>{POLISH_SOURCE_LABEL.regular}</Tag>
+          )}
+          {record.claimState === 'unclaimed' && <Tag color="red">待认领</Tag>}
+        </Space>
+      ),
+    },
     {
       title: '操作',
       key: 'action',
-      width: 250,
+      width: 150,
       render: (_value, record) => (
         <Space size={4} wrap>
-          <Tooltip title="打磨完成并回写道次状态">
-            <Button size="small" type="link" onClick={() => void finishPolish(record)}>
-              完成打磨
-            </Button>
-          </Tooltip>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
             title="删除该打磨记录"
+            description="只删打磨底稿，不改动任何道次状态。"
             okText="确认"
             cancelText="取消"
-            onConfirm={() => void polishTable.remove(record.id).then(() => message.success('已删除'))}
+            onConfirm={() => void removePolish(record.id).then(() => message.success('已删除'))}
           >
             <Button size="small" type="link" danger icon={<DeleteOutlined />}>
               删除
@@ -205,12 +262,69 @@ export default function PolishBoard() {
     },
   ];
 
+  /** 待认领导出（跨胎体） */
+  const unclaimedColumns: ColumnsType<Polish> = [
+    {
+      title: '胎体',
+      dataIndex: 'bodyId',
+      width: 130,
+      render: (value: string) => bodies.find((body) => body.id === value)?.code ?? value,
+    },
+    {
+      title: '拟挂道次',
+      dataIndex: 'coatSeq',
+      width: 120,
+      render: (coatSeq: number | null, record) => {
+        if (coatSeq === null) return <Tag>未指明</Tag>;
+        const coat = coatOf(record.bodyId, coatSeq);
+        return coat ? (
+          <StageTag state={coat.state} seq={coat.seq} needRecheck={coat.needRecheck} />
+        ) : (
+          <Tag color="red">第 {coatSeq} 道（不存在）</Tag>
+        );
+      },
+    },
+    { title: '目数', dataIndex: 'grit', width: 90, render: (value: number) => <Tag color="gold">{value} 目</Tag> },
+    {
+      title: '手法',
+      dataIndex: 'method',
+      width: 90,
+      render: (value: PolishMethod) => <Tag color={POLISH_METHOD_COLOR[value]}>{POLISH_METHOD_LABEL[value]}</Tag>,
+    },
+    { title: '操作人', dataIndex: 'operator', width: 90, render: (value: string) => value || '未填写' },
+    {
+      title: '认领到待打磨道次',
+      key: 'claim',
+      render: (_value, record) => {
+        const waitingCoats = coats
+          .filter((coat) => coat.bodyId === record.bodyId && coat.state === 'toPolish')
+          .sort((a, b) => a.seq - b.seq);
+        return waitingCoats.length === 0 ? (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            该胎体没有待打磨道次，无法认领
+          </Typography.Text>
+        ) : (
+          <Select
+            size="small"
+            style={{ minWidth: 200 }}
+            placeholder="选择待打磨道次挂名"
+            options={waitingCoats.map((coat) => ({
+              value: coat.seq,
+              label: `第 ${coat.seq} 道 · ${coat.colorName}`,
+            }))}
+            onChange={(value: number) => claim(record, value)}
+          />
+        );
+      },
+    },
+  ];
+
   return (
     <div>
       <div className="gb-page-head">
         <div>
-          <h2>打磨与推光工序</h2>
-          <p>按道次生成目数序列并登记手法与耗时；未打磨完的道次禁止进入下一道罩漆。</p>
+          <h2>打磨与推光工序（打磨工位底稿）</h2>
+          <p>只管打磨推光记录与磨料目数；挂名到待打磨道次。已罩漆的道次不退回，补不上的单列待认领。</p>
         </div>
         <Space wrap>
           <Select
@@ -224,7 +338,7 @@ export default function PolishBoard() {
             onChange={(value: string) => setCurrentBodyId(value)}
           />
           <Button icon={<ThunderboltOutlined />} onClick={() => void generateSequence()}>
-            按道次生成序列
+            按待打磨道次挂名
           </Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
             新增打磨记录
@@ -233,11 +347,12 @@ export default function PolishBoard() {
       </div>
 
       <div className="gb-stat-row">
-        <StatBadge label="打磨记录" value={rows.length} suffix="条" tone="primary" />
+        <StatBadge label="本胎体记录" value={rows.length} suffix="条" tone="primary" />
         <StatBadge label="累计耗时" value={totalMinutes} suffix="分钟" tone="info" />
         <StatBadge label="最高目数" value={maxGrit || '-'} suffix="目" tone="warning" />
         <StatBadge label="道次完成率" value={`${stat?.coatPercent ?? 0}%`} percent={stat?.coatPercent ?? 0} tone="success" />
-        <StatBadge label="阻塞道次" value={blocked.length} suffix="道" tone="danger" />
+        <StatBadge label="待打磨未挂名" value={blocked.length} suffix="道" tone="danger" />
+        <StatBadge label="待认领" value={unclaimedRows.length} suffix="条" tone="danger" />
       </div>
 
       {blocked.length > 0 ? (
@@ -245,40 +360,72 @@ export default function PolishBoard() {
           type="warning"
           showIcon
           style={{ marginBottom: 14 }}
-          message={`第 ${blocked.map((coat) => coat.seq).join('、')} 道尚未打磨完成，禁止进入下一道罩漆`}
-          description="请先补登打磨记录并点击「完成打磨」，把道次推进为已完成。"
+          message={`第 ${blocked.map((coat) => coat.seq).join('、')} 道处于待打磨且名下无挂名记录`}
+          description="髹涂工序台推道次时会对挂名打磨记录并要求目数比上一道更细；请先挂名，否则道次停在待打磨。"
         />
       ) : (
-        <Alert type="success" showIcon style={{ marginBottom: 14 }} message="当前胎体道次打磨均已闭环，可继续下一道罩漆" />
+        <Alert type="success" showIcon style={{ marginBottom: 14 }} message="当前胎体待打磨道次均已挂名，能否罩漆由髹涂工序台核验目数" />
       )}
 
-      <Card className="gb-table-card" styles={{ body: { padding: 0 } }}>
+      <Card
+        className="gb-table-card"
+        title="打磨推光记录（按工位序号）"
+        styles={{ body: { padding: 0 } }}
+      >
         {rows.length === 0 ? (
           <EmptyPanel
             title={bodyCoats.length === 0 ? '该胎体尚未编排道次' : '还没有打磨记录'}
             description={
               bodyCoats.length === 0
-                ? '先到「髹涂道次」页编排道次，再按道次生成打磨目数序列。'
-                : '可点击「按道次生成序列」按 320→2000 目自动铺排，再逐条补录操作人。'
+                ? '先到「髹涂道次」页编排道次；待道次进入待打磨后再挂名登记。'
+                : '可点击「按待打磨道次挂名」自动铺排目数，或手动新增（含事后补记）。'
             }
-            actionText="按道次生成序列"
+            actionText="按待打磨道次挂名"
             onAction={() => void generateSequence()}
             secondaryText="新增打磨记录"
             onSecondary={openCreate}
             size="small"
           />
         ) : (
-          <Table<Polish> rowKey="id" size="small" pagination={{ pageSize: 8 }} columns={columns} dataSource={rows} />
+          <Table<Polish> rowKey="id" size="small" pagination={{ pageSize: 8 }} columns={linkedColumns} dataSource={rows} />
+        )}
+      </Card>
+
+      <Card
+        className="gb-table-card"
+        style={{ marginTop: 16 }}
+        title={
+          <Space>
+            <LinkOutlined />
+            <span>待认领（工位单列 · 全部胎体）</span>
+            <Tag color="red">{unclaimedRows.length}</Tag>
+          </Space>
+        }
+        styles={{ body: { padding: 0 } }}
+      >
+        {unclaimedRows.length === 0 ? (
+          <Typography.Text type="secondary" style={{ display: 'block', padding: 16 }}>
+            没有补不上道次的打磨记录。
+          </Typography.Text>
+        ) : (
+          <Table<Polish>
+            rowKey="id"
+            size="small"
+            pagination={{ pageSize: 5 }}
+            columns={unclaimedColumns}
+            dataSource={unclaimedRows}
+          />
         )}
       </Card>
 
       <Typography.Text type="secondary" style={{ display: 'block', marginTop: 10 }}>
-        标准目数序列：{GRIT_SEQUENCE.join(' → ')} 目；当前胎体打磨 {rows.length} 条记录。
+        标准目数序列：{GRIT_SEQUENCE.join(' → ')} 目（数字越大越细）；本胎体 {rows.length} 条、待认领 {bodyUnclaimed.length} 条。
+        打磨工位不回写道次，已罩漆道次不会因补记退回。
       </Typography.Text>
 
       <Modal
         open={open}
-        title={editing ? `编辑第 ${editing.seq} 道打磨记录` : '新增打磨记录'}
+        title={editing ? `编辑打磨记录（工位序号 ${editing.seq}）` : '新增打磨记录'}
         onCancel={() => setOpen(false)}
         onOk={() => void submit()}
         okText="保存"
@@ -287,16 +434,13 @@ export default function PolishBoard() {
       >
         <Form form={form} layout="vertical" preserve={false}>
           <Space size={12} style={{ display: 'flex' }}>
-            <Form.Item name="seq" label="关联道次" rules={[{ required: true }]} style={{ flex: 1 }}>
-              <Select
-                options={(bodyCoats.length > 0
-                  ? bodyCoats.map((coat) => ({ value: coat.seq, label: `第 ${coat.seq} 道 · ${coat.colorName}` }))
-                  : [{ value: 1, label: '第 1 道' }]
-                )}
-              />
+            <Form.Item name="coatSeq" label="挂名道次" rules={[{ required: true }]} style={{ flex: 1 }}>
+              <Select options={coatOptions} />
             </Form.Item>
-            <Form.Item name="grit" label="磨料目数" rules={[{ required: true }]} style={{ flex: 1 }}>
-              <Select options={GRIT_SEQUENCE.map((grit) => ({ value: grit, label: `${grit} 目` }))} />
+            <Form.Item name="grit" label="磨料目数（需比上一道更细）" rules={[{ required: true }]} style={{ flex: 1 }}>
+              <Select
+                options={GRIT_OPTIONS.map((grit) => ({ value: grit, label: `${grit} 目` }))}
+              />
             </Form.Item>
           </Space>
           <Space size={12} style={{ display: 'flex' }}>
@@ -310,6 +454,14 @@ export default function PolishBoard() {
           <Form.Item name="operator" label="操作人">
             <Input placeholder="如：王丽" />
           </Form.Item>
+          <Form.Item name="late" valuePropName="checked" tooltip="事后补记时，已罩漆的道次不会退回；补不上则列为待认领">
+            <Checkbox>事后补记（工位补录，可能已罩漆）</Checkbox>
+          </Form.Item>
+          <Alert
+            type="info"
+            showIcon
+            message="只有处于「待打磨」的道次接收挂名；已完成（已罩漆）的道次不退回，记录将进入下方待认领。"
+          />
         </Form>
       </Modal>
     </div>

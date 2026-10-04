@@ -36,6 +36,7 @@ import StageTag from '@/components/common/StageTag';
 import { useCoatProgress } from '@/hooks/useCoatProgress';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { usePolishStore } from '@/stores/polishStore';
 import {
   COAT_STATE_LABEL,
   COAT_STATE_OPTIONS,
@@ -50,6 +51,14 @@ import {
 } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
 import { suggestIntervalHours } from '@/utils/humidity';
+
+/** 取某道次名下挂名的打磨记录里最细的目数（只读打磨底稿） */
+function linkedGritOf(polishGritRows: { coatSeq: number | null; claimState: string; grit: number }[], coatSeq: number): number | null {
+  const grits = polishGritRows
+    .filter((row) => row.claimState === 'linked' && row.coatSeq === coatSeq)
+    .map((row) => row.grit);
+  return grits.length === 0 ? null : Math.max(...grits);
+}
 
 const FILTER_KEYS = ['paintType', 'state'] as const;
 
@@ -74,6 +83,7 @@ export default function CoatBoard() {
   const reorderCoats = useCoatStore((state) => state.reorderCoats);
   const nextSeq = useCoatStore((state) => state.nextSeq);
   const suggestForBody = useCoatStore((state) => state.suggestForBody);
+  const polishes = usePolishStore((state) => state.polishes);
 
   const { progressOf, currentCoatText, totals } = useCoatProgress();
   const url = useFilterQuery(FILTER_KEYS);
@@ -96,6 +106,12 @@ export default function CoatBoard() {
   const bodyCoats = useMemo(
     () => coats.filter((coat) => coat.bodyId === bodyId).sort((a, b) => a.seq - b.seq),
     [coats, bodyId],
+  );
+
+  /** 打磨工位挂在本胎体各道次名下的记录（只读，不回写打磨底稿） */
+  const bodyPolishRows = useMemo(
+    () => polishes.filter((item) => item.bodyId === bodyId),
+    [polishes, bodyId],
   );
 
   const filtered = useMemo(() => {
@@ -178,14 +194,19 @@ export default function CoatBoard() {
     message.success('道次顺序已更新并重编号');
   };
 
-  /** 状态推进校验：前一道未完成时禁止进入下一道 */
+  /** 状态推进：前一道未完成禁止进入下一道；推出待打磨前由 store 对挂名打磨与目数 */
   const handleAdvance = async (coat: Coat): Promise<void> => {
     const previous = bodyCoats.find((item) => item.seq === coat.seq - 1);
     if (previous && previous.state !== 'done') {
       message.warning(`第 ${previous.seq} 道尚未完成，禁止进入第 ${coat.seq} 道`);
       return;
     }
-    await advanceState(coat.id);
+    const outcome = await advanceState(coat.id);
+    if (outcome.moved) {
+      message.success(outcome.message);
+    } else {
+      message.warning(outcome.message);
+    }
   };
 
   const columns: ColumnsType<Coat> = [
@@ -226,6 +247,32 @@ export default function CoatBoard() {
       dataIndex: 'thicknessUm',
       width: 120,
       render: (value: number) => `${value} μm`,
+    },
+    {
+      title: '挂名打磨目数',
+      key: 'polishGrit',
+      width: 130,
+      render: (_value, record) => {
+        const grit = linkedGritOf(bodyPolishRows, record.seq);
+        if (grit === null) {
+          return record.state === 'toPolish' ? (
+            <Tooltip title="该道名下没有挂名打磨记录，推道次会停在待打磨">
+              <Tag color="red">无挂名</Tag>
+            </Tooltip>
+          ) : (
+            <Typography.Text type="secondary">—</Typography.Text>
+          );
+        }
+        const prevGrit = linkedGritOf(bodyPolishRows, record.seq - 1);
+        const finer = prevGrit === null || grit > prevGrit;
+        return (
+          <Tooltip title={prevGrit === null ? '无上一道可比对' : `上一道挂名 ${prevGrit} 目`}>
+            <Tag color={finer ? 'gold' : 'red'}>
+              {grit} 目{prevGrit !== null ? (finer ? ' ✓' : ' 不够细') : ''}
+            </Tag>
+          </Tooltip>
+        );
+      },
     },
     {
       title: '操作',
@@ -338,8 +385,7 @@ export default function CoatBoard() {
               }
             >
               批量改漆种
-            </Button>
-            <Select
+            </Button>            <Select
               size="small"
               style={{ width: 120 }}
               value={batchState}
@@ -350,8 +396,12 @@ export default function CoatBoard() {
               size="small"
               disabled={selectedIds.length === 0}
               onClick={() =>
-                void batchUpdate(selectedIds, { state: batchState }).then(() => {
-                  message.success(`已批量改为${COAT_STATE_LABEL[batchState]}`);
+                void batchUpdate(selectedIds, { state: batchState }).then((stat) => {
+                  if (stat.blocked > 0) {
+                    message.warning(`已更新 ${stat.updated} 道；${stat.blocked} 道停在待打磨：${stat.blockedMessages.join('；')}`);
+                  } else {
+                    message.success(`已批量改为${COAT_STATE_LABEL[batchState]}（${stat.updated} 道）`);
+                  }
                   setSelectedIds([]);
                 })
               }
